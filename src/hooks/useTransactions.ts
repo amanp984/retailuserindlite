@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { supabase } from "@/integrations/supabase/client";
 import { accounts } from "@/lib/banking-data";
 
 // UI transaction shape — matches what the dashboard already expects.
@@ -13,7 +12,6 @@ export interface UiTransaction {
   debit: number;
   credit: number;
   balance: number;
-  // raw fields, if a consumer wants them
   reference: string | null;
   bank: string | null;
   accountLast4: string | null;
@@ -30,12 +28,11 @@ interface DbRow {
   bank_name: string | null;
   account_number_last4: string | null;
   message: string | null;
-  sms_sender: string | null;
-  raw_sms: string | null;
   transaction_date: string;
 }
 
 const STARTING_BALANCE = accounts[0]?.balance ?? 0;
+const POLL_MS = 15000;
 
 function formatDate(iso: string): { isoDate: string; date: string } {
   const d = new Date(iso);
@@ -58,7 +55,6 @@ function buildNarration(row: DbRow): string {
 }
 
 function mapRows(rows: DbRow[]): UiTransaction[] {
-  // rows are sorted newest first by caller; compute running balance from newest = STARTING_BALANCE downward.
   let running = STARTING_BALANCE;
   return rows.map((r) => {
     const amount = Number(r.amount) || 0;
@@ -71,7 +67,7 @@ function mapRows(rows: DbRow[]): UiTransaction[] {
       isoDate,
       date,
       narration: buildNarration(r) || (r.message ?? "Transaction"),
-      channel: (r.bank_name || r.sms_sender || "SMS").toString(),
+      channel: (r.bank_name || "SMS").toString(),
       type,
       debit,
       credit,
@@ -79,10 +75,9 @@ function mapRows(rows: DbRow[]): UiTransaction[] {
       reference: r.transaction_reference,
       bank: r.bank_name,
       accountLast4: r.account_number_last4,
-      rawSms: r.raw_sms,
-      smsSender: r.sms_sender,
+      rawSms: null,
+      smsSender: null,
     };
-    // step running balance backwards for the next (older) txn
     running = running - credit + debit;
     return txn;
   });
@@ -96,35 +91,25 @@ export function useTransactions() {
     let active = true;
 
     const load = async () => {
-      const { data, error } = await supabase
-        .from("transactions")
-        .select("*")
-        .order("transaction_date", { ascending: false })
-        .limit(500);
-      if (!active) return;
-      if (error) {
-        console.error("[useTransactions] load error", error);
-        setLoading(false);
-        return;
+      try {
+        const res = await fetch("/api/transactions", { credentials: "omit" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const body = await res.json();
+        if (!active) return;
+        const rows: DbRow[] = Array.isArray(body?.transactions) ? body.transactions : [];
+        setTransactions(mapRows(rows));
+      } catch (err) {
+        console.error("[useTransactions] load error", err);
+      } finally {
+        if (active) setLoading(false);
       }
-      setTransactions(mapRows((data || []) as DbRow[]));
-      setLoading(false);
     };
 
     load();
-
-    const channel = supabase
-      .channel("transactions-realtime")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "transactions" },
-        () => load(),
-      )
-      .subscribe();
-
+    const interval = window.setInterval(load, POLL_MS);
     return () => {
       active = false;
-      supabase.removeChannel(channel);
+      window.clearInterval(interval);
     };
   }, []);
 
