@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { supabase } from "@/integrations/supabase/client";
 import { accounts } from "@/lib/banking-data";
 
 // UI transaction shape — matches what the dashboard already expects.
@@ -32,7 +33,7 @@ interface DbRow {
 }
 
 const STARTING_BALANCE = accounts[0]?.balance ?? 0;
-const POLL_MS = 15000;
+const POLL_MS = 10000;
 
 function formatDate(iso: string): { isoDate: string; date: string } {
   const d = new Date(iso);
@@ -83,6 +84,21 @@ function mapRows(rows: DbRow[]): UiTransaction[] {
   });
 }
 
+async function fetchTransactions(): Promise<DbRow[]> {
+  const { data, error } = await supabase.functions.invoke("get-transactions", {
+    method: "GET",
+  });
+  if (error) {
+    console.error("[useTransactions] edge function error", error);
+    throw error;
+  }
+  const rows = Array.isArray((data as any)?.transactions)
+    ? ((data as any).transactions as DbRow[])
+    : [];
+  console.log(`[useTransactions] fetched ${rows.length} rows`);
+  return rows;
+}
+
 export function useTransactions() {
   const [transactions, setTransactions] = useState<UiTransaction[]>([]);
   const [loading, setLoading] = useState(true);
@@ -92,11 +108,8 @@ export function useTransactions() {
 
     const load = async () => {
       try {
-        const res = await fetch("/api/transactions", { credentials: "omit" });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const body = await res.json();
+        const rows = await fetchTransactions();
         if (!active) return;
-        const rows: DbRow[] = Array.isArray(body?.transactions) ? body.transactions : [];
         setTransactions(mapRows(rows));
       } catch (err) {
         console.error("[useTransactions] load error", err);
@@ -106,10 +119,31 @@ export function useTransactions() {
     };
 
     load();
+
+    // Realtime: refetch whenever the transactions table changes.
+    // (RLS blocks anon reads, but Realtime broadcast events still fire; we
+    // only use the event as a trigger to re-invoke the edge function.)
+    const channel = supabase
+      .channel("transactions-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "transactions" },
+        (payload) => {
+          console.log("[useTransactions] realtime event", payload.eventType);
+          load();
+        },
+      )
+      .subscribe((status) => {
+        console.log("[useTransactions] realtime status", status);
+      });
+
+    // Fallback polling in case realtime is unavailable.
     const interval = window.setInterval(load, POLL_MS);
+
     return () => {
       active = false;
       window.clearInterval(interval);
+      supabase.removeChannel(channel);
     };
   }, []);
 
